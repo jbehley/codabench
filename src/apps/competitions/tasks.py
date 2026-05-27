@@ -8,10 +8,14 @@ from datetime import timedelta, datetime
 from io import BytesIO
 from tempfile import TemporaryDirectory, NamedTemporaryFile
 
+# import json
+# import urllib
+
 import oyaml as yaml
 import requests
 from celery._state import app_or_default
 from django.conf import settings
+# from django_redis import get_redis_connection
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.files.base import ContentFile
 from django.db.models import Subquery, OuterRef, Count, Case, When, Value, F
@@ -20,9 +24,10 @@ from django.utils.text import slugify
 from django.utils.timezone import now
 from rest_framework.exceptions import ValidationError
 
-from celery_config import app
+from celery_config import app  # , app_for_vhost
 from competitions.models import Submission, CompetitionCreationTaskStatus, SubmissionDetails, Competition, \
     CompetitionDump, Phase
+# from queues.models import Queue
 from competitions.unpackers.utils import CompetitionUnpackingException
 from competitions.unpackers.v1 import V15Unpacker
 from competitions.unpackers.v2 import V2Unpacker
@@ -31,8 +36,12 @@ from tasks.models import Task
 from datasets.models import Data
 from utils.data import make_url_sassy
 from utils.email import codalab_send_markdown_email
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
 
 import logging
+
+# from utils.worker_utils import WORKER_HEARTBEAT_TTL, WORKERS_REGISTRY_KEY, extract_queue_names, is_compute_worker, known_compute_queue_names
 logger = logging.getLogger(__name__)
 
 COMPETITION_FIELDS = [
@@ -165,7 +174,7 @@ def _send_to_compute_worker(submission, is_scoring):
 
     if task.ingestion_program:
         if (task.ingestion_only_during_scoring and is_scoring) or (not task.ingestion_only_during_scoring and not is_scoring):
-            run_args['ingestion_program'] = make_url_sassy(task.ingestion_program.data_file.name)
+            run_args['ingestion_program_data'] = make_url_sassy(task.ingestion_program.data_file.name)
 
     if task.input_data and (not is_scoring or task.ingestion_only_during_scoring):
         run_args['input_data'] = make_url_sassy(task.input_data.data_file.name)
@@ -175,9 +184,14 @@ def _send_to_compute_worker(submission, is_scoring):
 
     run_args['ingestion_only_during_scoring'] = task.ingestion_only_during_scoring
 
-    run_args['program_data'] = make_url_sassy(
-        path=submission.data.data_file.name if not is_scoring else task.scoring_program.data_file.name
-    )
+    if is_scoring:
+        run_args['scoring_program_data'] = make_url_sassy(path=task.scoring_program.data_file.name)
+
+    if not submission.data:
+        logger.error("Submission %s has no data file; marking as failed.", submission.pk)
+        submission.cancel(status=Submission.FAILED)
+        return
+    run_args['submission_data'] = make_url_sassy(path=submission.data.data_file.name)
 
     if not is_scoring:
         detail_names = SubmissionDetails.DETAILED_OUTPUT_NAMES_PREDICTION
@@ -790,3 +804,18 @@ def submission_status_cleanup():
                 sub.parent.cancel(status=Submission.FAILED)
             else:
                 sub.cancel(status=Submission.FAILED)
+
+
+# -------------------------------------------------
+def _broadcast_worker_state(payload):
+    channel_layer = get_channel_layer()
+    if not channel_layer:
+        return
+
+    async_to_sync(channel_layer.group_send)(
+        "compute_workers",
+        {
+            "type": "worker.health",
+            "worker": payload,
+        },
+    )
